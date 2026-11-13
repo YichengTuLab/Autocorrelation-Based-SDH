@@ -1833,7 +1833,68 @@ void compute_histogram_autocorrelation_nD(TreeNode *root, int tree_depth,
                                                  num_threads, &time_autocorr);
     printf("   Autocorrelation time: %.3f s\n", time_autocorr);
 
-    // Build displacement tasks.
+    if (g_approx_mode) {
+        // Approximate mode: Algorithm 2, lines 4-8 in one pass.  For every occupied canonical class, compute the
+        // distance bounds and buckets, then add the count to its bucket or split it with Distribute.  No task
+        // records are stored.  Exact mode keeps the task list below, which it sorts by pair count to balance the
+        // point-to-point work across threads.
+        double t_fused_start = get_wall_time();
+        long long intra_pair_count = 0;
+        for (int k = 0; k < lg->num_non_empty; k++) {
+            long long c = lg->non_empty_cells[k].count;
+            intra_pair_count += c * (c - 1) / 2;
+        }
+        #pragma omp parallel
+        {
+            long long *local_histogram = (long long*)calloc(num_bins, sizeof(long long));
+            Statistics local_stats = {0};
+            #pragma omp for schedule(static) nowait
+            for (long long out_idx = 0; out_idx < ac_size; out_idx++) {
+                int dvec[MAX_DIM]; long long tt = out_idx;
+                for (int k = D - 1; k >= 0; k--) {
+                    int u = (int)(tt % ac_per_axis);
+                    dvec[k] = u - (m - 1);
+                    tt /= ac_per_axis;
+                }
+                if (!disp_is_canonical(dvec, D)) continue;
+                long long pair_count = (long long)round(ac[out_idx]);
+                if (pair_count == 0) continue;
+                int all_zero = 1;
+                for (int k = 0; k < D; k++) if (dvec[k] != 0) { all_zero = 0; break; }
+                if (all_zero) pair_count = intra_pair_count;
+                double d_min, d_max;
+                get_displacement_distance_range_nD(dvec, lg->cell_size, &d_min, &d_max);
+                int bmin = binspec_bin(bs, d_min);
+                int bmax = binspec_bin(bs, d_max);
+                if (bmin == bmax) {
+                    local_histogram[bmin] += pair_count;
+                    local_stats.pruned_pairs += pair_count;
+                    local_stats.coarse_resolved_pairs += pair_count;
+                    local_stats.prune_operations++;
+                } else {
+                    distribute_pairs_heuristic_disp(pair_count, d_min, d_max, bmin, bmax,
+                                                    local_histogram, bs, &local_stats);
+                }
+            }
+            #pragma omp critical
+            {
+                for (int b = 0; b < num_bins; b++) histogram[b] += local_histogram[b];
+                stats->exact_distance_computations += local_stats.exact_distance_computations;
+                stats->pruned_pairs                += local_stats.pruned_pairs;
+                stats->leaf_comparisons            += local_stats.leaf_comparisons;
+                stats->prune_operations            += local_stats.prune_operations;
+                stats->displacement_distance_calls += local_stats.displacement_distance_calls;
+                stats->coarse_resolved_pairs       += local_stats.coarse_resolved_pairs;
+            }
+            free(local_histogram);
+        }
+        printf("   Fused classification and bucket assignment (%.3f s)\n", get_wall_time() - t_fused_start);
+        free(ac);
+        free_leaf_grid(lg);
+        return;
+    }
+
+    // Build displacement tasks (exact mode).
     printf("   Building displacement tasks (ac_size=%lld)...\n", ac_size);
     double t_build_start = get_wall_time();
     DispTaskND **t_bufs = (DispTaskND**)calloc(num_threads, sizeof(DispTaskND*));
